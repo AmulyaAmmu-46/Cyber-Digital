@@ -1,99 +1,154 @@
+
 pipeline {
-    agent { label 'windows-docker' }
+    agent any
 
     options {
-        skipDefaultCheckout(true)
+        disableConcurrentBuilds()
     }
 
     environment {
-        ACR_NAME = "cyberforensicsacr"
-        IMAGE_NAME = "${ACR_NAME}.azurecr.io/digital-forensics-platform"
-        IMAGE_TAG = "build-${BUILD_NUMBER}"
-        TRIVY_IMAGE = "aquasec/trivy:0.75.0"
-        REGISTRY_CREDENTIALS = "acr-credentials"
-        APP_SECRET_CREDENTIALS = "forensics-secret-key"
-        DATABASE_CREDENTIALS = "forensics-database-uri"
+        VM_IP = '20.193.134.57'
+        VM_USER = 'azureuser'
     }
 
     stages {
-        stage('Checkout') {
-            steps {
-                checkout scm
-            }
-        }
-
-        stage('Validate Windows Docker Agent') {
-            steps {
-                bat '''
-@echo off
-docker version
-if errorlevel 1 exit /b %errorlevel%
-'''
-            }
-        }
-
-        stage('Unit Tests') {
-            steps {
-                bat '''
-@echo off
-docker run --rm --mount "type=bind,source=%WORKSPACE%,target=/workspace,readonly" --workdir /workspace python:3.12-slim sh -c "python -m venv /tmp/venv && /tmp/venv/bin/python -m pip install --disable-pip-version-check -r requirements-dev.txt && /tmp/venv/bin/python -m pytest -p no:cacheprovider --basetemp /tmp/pytest-tmp tests/"
-if errorlevel 1 exit /b %errorlevel%
-'''
-            }
-        }
-
-        stage('Build Docker Image') {
-            steps {
-                bat '''
-@echo off
-docker build --pull -t "%IMAGE_NAME%:%IMAGE_TAG%" .
-if errorlevel 1 exit /b %errorlevel%
-'''
-            }
-        }
-
-        stage('Security Scanning') {
-            steps {
-                bat '''
-@echo off
-docker save --output "%WORKSPACE%\\digital-evidence-image.tar" "%IMAGE_NAME%:%IMAGE_TAG%"
-if errorlevel 1 exit /b %errorlevel%
-docker run --rm --mount "type=bind,source=%WORKSPACE%,target=/work,readonly" "%TRIVY_IMAGE%" image --input /work/digital-evidence-image.tar --ignore-unfixed --exit-code 1 --severity HIGH,CRITICAL
-if errorlevel 1 exit /b %errorlevel%
-'''
-            }
-        }
-
-        stage('Push to Azure Container Registry') {
-            steps {
-                withCredentials([usernamePassword(credentialsId: "${REGISTRY_CREDENTIALS}", passwordVariable: 'ACR_PASSWORD', usernameVariable: 'ACR_USERNAME')]) {
-                    bat 'powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts\\jenkins-push-acr.ps1'
-                    bat 'docker push "%IMAGE_NAME%:%IMAGE_TAG%"'
-                }
-            }
-        }
-
-        stage('Deploy to Kubernetes') {
+        stage('Deploy to Azure VM') {
             steps {
                 withCredentials([
-                    string(credentialsId: "${APP_SECRET_CREDENTIALS}", variable: 'APP_SECRET_KEY'),
-                    string(credentialsId: "${DATABASE_CREDENTIALS}", variable: 'DATABASE_URI')
+                    sshUserPrivateKey(
+                        credentialsId: 'azure-vm-ssh',
+                        keyFileVariable: 'SSH_KEY',
+                        usernameVariable: 'SSH_USER'
+                    ),
+                    string(
+                        credentialsId: 'SECRET_KEY',
+                        variable: 'APP_SECRET'
+                    ),
+                    string(
+                        credentialsId: 'POSTGRES_PASSWORD',
+                        variable: 'DB_PASS'
+                    )
                 ]) {
-                    bat 'powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts\\jenkins-deploy-k8s.ps1'
+                    powershell '''
+                        $ErrorActionPreference = "Stop"
+
+                        $sshExe = (Get-Command ssh.exe -ErrorAction Stop).Source
+
+                        # Create production environment file
+                        $envText = @"
+APP_ENV=production
+HOST=0.0.0.0
+PORT=5000
+SECRET_KEY=$env:APP_SECRET
+POSTGRES_USER=forensics
+POSTGRES_PASSWORD=$env:DB_PASS
+POSTGRES_DB=forensics
+"@
+
+                        # Encode environment file for safe SSH transfer
+                        $envBase64 = [Convert]::ToBase64String(
+                            [Text.Encoding]::UTF8.GetBytes($envText)
+                        )
+
+                        # Commands executed on Azure VM
+                        $remoteScript = @'
+set -e
+
+BASE_DIR="$HOME/digital-evidence"
+REPO_DIR="$BASE_DIR/Cyber-Digital"
+PROJECT_DIR="$REPO_DIR/Digital-Evidence-Integrity-main"
+
+mkdir -p "$BASE_DIR"
+
+if [ ! -d "$REPO_DIR/.git" ]; then
+    git clone --branch main \
+      "https://github.com/AmulyaAmmu-46/Cyber-Digital.git" \
+      "$REPO_DIR"
+else
+    git -C "$REPO_DIR" pull --ff-only origin main
+fi
+
+cd "$PROJECT_DIR"
+
+if [ ! -f docker-compose.yml ]; then
+    echo "ERROR: docker-compose.yml not found"
+    exit 1
+fi
+
+printf '%s' '__ENV_BASE64__' | base64 -d > .env
+chmod 600 .env
+
+docker-compose config -q
+docker-compose up -d --build
+docker-compose ps
+'@
+
+                        $remoteScript = $remoteScript.Replace(
+                            '__ENV_BASE64__',
+                            $envBase64
+                        )
+
+                        # Write remote script as UTF-8 without BOM
+                        $scriptPath = Join-Path $env:TEMP "azure-deploy-$env:BUILD_NUMBER.sh"
+
+                        [IO.File]::WriteAllText(
+                            $scriptPath,
+                            $remoteScript,
+                            (New-Object System.Text.UTF8Encoding($false))
+                        )
+
+                        try {
+                            # Connect using the Jenkins SSH credential
+                            $psi = New-Object System.Diagnostics.ProcessStartInfo
+                            $psi.FileName = $sshExe
+                            $psi.Arguments = '-i "' + $env:SSH_KEY +
+                                '" -o StrictHostKeyChecking=accept-new ' +
+                                $env:SSH_USER + '@' + $env:VM_IP + ' bash -s'
+
+                            $psi.UseShellExecute = $false
+                            $psi.RedirectStandardInput = $true
+                            $psi.RedirectStandardOutput = $true
+                            $psi.RedirectStandardError = $true
+                            $psi.StandardInputEncoding = [Text.Encoding]::UTF8
+
+                            $process = New-Object System.Diagnostics.Process
+                            $process.StartInfo = $psi
+
+                            $null = $process.Start()
+
+                            $scriptContent = [IO.File]::ReadAllText($scriptPath)
+                            $process.StandardInput.Write($scriptContent)
+                            $process.StandardInput.Close()
+
+                            $stdout = $process.StandardOutput.ReadToEnd()
+                            $stderr = $process.StandardError.ReadToEnd()
+
+                            $process.WaitForExit()
+
+                            if ($stdout) { Write-Output $stdout }
+                            if ($stderr) { Write-Output $stderr }
+
+                            if ($process.ExitCode -ne 0) {
+                                throw "SSH deployment failed with exit code $($process.ExitCode)"
+                            }
+                        }
+                        finally {
+                            Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
+                        }
+                    '''
                 }
             }
         }
     }
 
     post {
-        always {
-            cleanWs()
-        }
         success {
-            echo "Pipeline executed successfully!"
+            echo 'Deployment completed successfully!'
+            echo 'Application URL: http://20.193.134.57:5000'
         }
+
         failure {
-            echo "Pipeline failed. Check logs for details."
+            echo 'Deployment failed. Check Jenkins Console Output.'
         }
     }
 }
