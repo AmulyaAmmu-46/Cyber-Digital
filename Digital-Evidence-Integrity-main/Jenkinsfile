@@ -103,16 +103,26 @@ $COMPOSE ps
                             (New-Object System.Text.UTF8Encoding($false))
                         )
 
-                        try {
-                            # Fix Windows OpenSSH key permissions if needed
-                            try {
-                                icacls.exe $env:SSH_KEY /inheritance:r /grant:r "$($env:USERNAME):(R)" | Out-Null
-                            } catch { }
+                        # Copy SSH key to a dedicated temp file and restrict permissions for Windows OpenSSH
+                        $localKey = Join-Path $env:TEMP "id_azure_$env:BUILD_NUMBER.pem"
+                        Copy-Item -Path $env:SSH_KEY -Destination $localKey -Force
 
-                            # Connect using the Jenkins SSH credential
+                        $acl = Get-Acl $localKey
+                        $acl.SetAccessRuleProtection($true, $false)
+                        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+                        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                            $identity.User,
+                            [System.Security.AccessControl.FileSystemRights]::FullControl,
+                            [System.Security.AccessControl.AccessControlType]::Allow
+                        )
+                        $acl.AddAccessRule($rule)
+                        Set-Acl -Path $localKey -AclObject $acl
+
+                        try {
+                            # Connect using the secured SSH key
                             $psi = New-Object System.Diagnostics.ProcessStartInfo
                             $psi.FileName = $sshExe
-                            $psi.Arguments = '-i "' + $env:SSH_KEY +
+                            $psi.Arguments = '-i "' + $localKey +
                                 '" -o StrictHostKeyChecking=accept-new ' +
                                 $env:SSH_USER + '@' + $env:VM_IP + ' bash -s'
 
@@ -148,6 +158,7 @@ $COMPOSE ps
                         }
                         finally {
                             Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
+                            Remove-Item $localKey -Force -ErrorAction SilentlyContinue
                         }
                     '''
                 }
