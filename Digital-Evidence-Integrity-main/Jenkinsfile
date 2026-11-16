@@ -78,9 +78,15 @@ fi
 printf '%s' '__ENV_BASE64__' | base64 -d > .env
 chmod 600 .env
 
-docker-compose config -q
-docker-compose up -d --build
-docker-compose ps
+if command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE="docker-compose"
+else
+    COMPOSE="docker compose"
+fi
+
+$COMPOSE config -q
+$COMPOSE up -d --build
+$COMPOSE ps
 '@
 
                         $remoteScript = $remoteScript.Replace(
@@ -98,6 +104,11 @@ docker-compose ps
                         )
 
                         try {
+                            # Fix Windows OpenSSH key permissions if needed
+                            try {
+                                icacls.exe $env:SSH_KEY /inheritance:r /grant:r "$($env:USERNAME):(R)" | Out-Null
+                            } catch { }
+
                             # Connect using the Jenkins SSH credential
                             $psi = New-Object System.Diagnostics.ProcessStartInfo
                             $psi.FileName = $sshExe
@@ -109,21 +120,24 @@ docker-compose ps
                             $psi.RedirectStandardInput = $true
                             $psi.RedirectStandardOutput = $true
                             $psi.RedirectStandardError = $true
-                            $psi.StandardInputEncoding = [Text.Encoding]::UTF8
 
                             $process = New-Object System.Diagnostics.Process
                             $process.StartInfo = $psi
 
                             $null = $process.Start()
 
+                            # Read stdout and stderr asynchronously to prevent deadlocks
+                            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+                            $stderrTask = $process.StandardError.ReadToEndAsync()
+
                             $scriptContent = [IO.File]::ReadAllText($scriptPath)
                             $process.StandardInput.Write($scriptContent)
                             $process.StandardInput.Close()
 
-                            $stdout = $process.StandardOutput.ReadToEnd()
-                            $stderr = $process.StandardError.ReadToEnd()
-
                             $process.WaitForExit()
+
+                            $stdout = $stdoutTask.Result
+                            $stderr = $stderrTask.Result
 
                             if ($stdout) { Write-Output $stdout }
                             if ($stderr) { Write-Output $stderr }
