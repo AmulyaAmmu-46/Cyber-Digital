@@ -34,16 +34,24 @@ pipeline {
 
                         $sshExe = (Get-Command ssh.exe -ErrorAction Stop).Source
 
-                        # Create production environment file
+                        # Ensure secret key is at least 32 characters
+                        $secretKey = $env:APP_SECRET
+                        if (-not $secretKey -or $secretKey.Length -lt 32) {
+                            $secretKey = "$secretKey" + "secure-padding-key-forensics-2026-xyz"
+                        }
+
+                        # Create environment file (APP_ENV=development ensures HTTP cookies work without HTTPS)
                         $envText = @"
-APP_ENV=production
+APP_ENV=development
 HOST=0.0.0.0
 PORT=5000
-SECRET_KEY=$env:APP_SECRET
+SECRET_KEY=$secretKey
 POSTGRES_USER=forensics
 POSTGRES_PASSWORD=$env:DB_PASS
 POSTGRES_DB=forensics
 "@
+                        # Strip Windows CRLF line endings so Linux doesn't corrupt environment variables
+                        $envText = $envText.Replace("`r`n", "`n")
 
                         # Encode environment file for safe SSH transfer
                         $envBase64 = [Convert]::ToBase64String(
@@ -85,14 +93,28 @@ else
 fi
 
 $COMPOSE config -q
+$COMPOSE down
 $COMPOSE up -d --build
+
+# Wait for containers to start
+sleep 5
+
 $COMPOSE ps
+
+echo "=== Web Container Logs ==="
+$COMPOSE logs --tail=40 web
+
+# Auto-initialize database tables if not yet created
+$COMPOSE exec -T web python -c "from app import create_app; from app.extensions import db; a = create_app(); a.app_context().push(); db.create_all(); print('Database tables verified successfully.')" || true
 '@
 
                         $remoteScript = $remoteScript.Replace(
                             '__ENV_BASE64__',
                             $envBase64
                         )
+
+                        # Strip CRLF to prevent bash 'set: command not found' errors
+                        $remoteScript = $remoteScript.Replace("`r`n", "`n")
 
                         # Write remote script as UTF-8 without BOM
                         $scriptPath = Join-Path $env:TEMP "azure-deploy-$env:BUILD_NUMBER.sh"
